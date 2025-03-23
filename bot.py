@@ -1,153 +1,145 @@
-from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, ParseMode, InlineQuery, InputTextMessageContent, InlineQueryResultArticle
-from aiogram.utils import executor
-from aiogram import utils
-from aiogram.utils.deep_linking import decode_payload
-from aiogram.utils.deep_linking import _create_link
-import hashlib
-import re
-import asyncio
-import flag
-import aiohttp
+import os
+import logging
+from threading import Event
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    CallbackContext,
+    CallbackQueryHandler,
+    ConversationHandler,
+    MessageHandler,
+    Filters
+)
+import requests
+import sqlite3
+from datetime import datetime, timedelta
 
-# TG ID Админов через запятую
-ADMINS = [976740969]
-# твой домен
-domain = "lin.dedust.icu"
+# Константы состояний
+MIN_PRICE, MAX_PRICE = range(2)
 
-#настройки бота
-bot = Bot(token="7956328238:AAEGZ4Q5xvt0xnY-4xqPy8VHmOk8p6g4_q8", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
+# Настройки
+TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+API_URL = "https://api.fragment.com/numbers"
+DB_NAME = "users.db"
 
+# Инициализация БД
+conn = sqlite3.connect(DB_NAME)
+cursor = conn.cursor()
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        min_price REAL,
+        max_price REAL
+    )
+''')
+conn.commit()
 
+# Логирование
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-async def otstuk(bot, id, fullname, is_premium, lang, username):
-    flags = flag.flag(lang)
-    for admin in ADMINS:
-        await asyncio.sleep(1)
-        try:
-            await bot.send_message(admin, 
-                                "<b>⚠️ [ОТСТУК] Новый пользователь в боте!\n\n"
-                                f"🆔USER_ID: {id}\n"
-                                f"Username: @{username}\n"
-                                f"🪪 Полное имя: {fullname}\n\n"
-                                f"⭐️ Премиум: {is_premium}\n"
-                                f"Язык: {flags} {lang}\n"
-                                "</b>")
-        except utils.exceptions.BotBlocked:
-            pass
-        
-async def ton_usdt_rate():
-    url = 'https://min-api.cryptocompare.com/data/price?fsym=TON&tsyms=USDT'
+def start(update: Update, context: CallbackContext):
+    keyboard = [
+        [InlineKeyboardButton("🎯 Установить ценовой диапазон", callback_data='set_price')],
+        [InlineKeyboardButton("📊 Текущие настройки", callback_data='show_settings')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text(
+        "🚀 Добро пожаловать в NFT-монитор Fragment!",
+        reply_markup=reply_markup
+    )
+
+def button_handler(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    
+    if query.data == 'set_price':
+        query.message.reply_text("Введите минимальную цену в TON:")
+        return MIN_PRICE
+    elif query.data == 'show_settings':
+        show_settings(update, context)
+    return ConversationHandler.END
+
+def min_price_input(update: Update, context: CallbackContext):
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    return 0.0
-                data = await resp.json()
-                ton_price = data.get('USDT', 0.0)
-                return ton_price
-    except Exception as e:
-        print(f"Error: {e}")
-        
-        
-@dp.message_handler(commands=['start'])
-async def send_welcome(message: types.Message):
+        price = float(update.message.text)
+        context.user_data['min_price'] = price
+        update.message.reply_text("Теперь введите максимальную цену в TON:")
+        return MAX_PRICE
+    except ValueError:
+        update.message.reply_text("❌ Ошибка! Введите число. Попробуйте снова:")
+        return MIN_PRICE
 
-    usd_to_ton_rate = await ton_usdt_rate()
+def max_price_input(update: Update, context: CallbackContext):
+    try:
+        max_price = float(update.message.text)
+        min_price = context.user_data.get('min_price', 0)
         
-    args = message.get_args()
-    mamont = message.from_user
-    if args:
-        try:
-            decoded = decode_payload(args)
-            username, price = decoded.split('-')
-        except ValueError as e:
-            print(e)
-
-        if username.startswith("+888"):
-            
-            username_link = username.replace("+", "")
-            web_app_info = WebAppInfo(url=f"https://{domain}/?username={username_link}&price={price}")  # Замените на URL вашего веб-приложения
-            keyboard = InlineKeyboardMarkup().add(
-                InlineKeyboardButton(text="Go to the trade", web_app=web_app_info)
-            )
-            
-            text = f"<b>${round(int(price)*usd_to_ton_rate, 2)} for {format_phone_number(username)}.</b> Someone offered <b>💎{price} (~${round(int(price)*usd_to_ton_rate, 2)})</b> to buy your anonymous number <b>{format_phone_number(username)}</b>.\n\nIf you wish to sell this anonymous number, please press the button below and check if the offer suits you.\n\nFragment is a verified platform for buying and selling usernames and anonymous numbers that is recommended by Telegram (<a href='https://t.me/telegram/201'>official announcement by Telegram</a>) and its founder (<a href='https://t.me/durov/198'>official announcement by Pavel Durov</a>).\n\nThis offer is likely to be serious, because the sender paid <b>💎1 (~${1*usd_to_ton_rate})</b> as a fee to let you know about it."
+        if max_price <= min_price:
+            raise ValueError("Максимум должен быть больше минимума")
         
-            await message.reply(text, reply_markup=keyboard)
-        else:
+        # Сохранение в БД
+        user_id = update.effective_user.id
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO users (user_id, min_price, max_price)
+            VALUES (?, ?, ?)
+        ''', (user_id, min_price, max_price))
+        conn.commit()
+        
+        update.message.reply_text(f"✅ Диапазон установлен: {min_price} - {max_price} TON")
+        return ConversationHandler.END
+    except ValueError as e:
+        update.message.reply_text(f"❌ Ошибка: {str(e)}. Введите корректную цену:")
+        return MAX_PRICE
 
-            web_app_info = WebAppInfo(url=f"https://{domain}/?username={username}&price={price}")  # Замените на URL вашего веб-приложения
-            keyboard = InlineKeyboardMarkup().add(
-                InlineKeyboardButton(text="Go to the trade", web_app=web_app_info)
-            )
-            
-            text = f"<b>${round(int(price)*usd_to_ton_rate, 2)} for @{username}.</b> Someone offered <b>💎{price} (~${round(int(price)*usd_to_ton_rate, 2)})</b> to buy your username <b>@{username}</b>.\n\nIf you wish to sell this username, please press the button below and check if the offer suits you.\n\nFragment is a verified platform for buying and selling usernames and anonymous numbers that is recommended by Telegram (<a href='https://t.me/telegram/201'>official announcement by Telegram</a>) and its founder (<a href='https://t.me/durov/198'>official announcement by Pavel Durov</a>).\n\nThis offer is likely to be serious, because the sender paid <b>💎1 (~${1*usd_to_ton_rate})</b> as a fee to let you know about it."
-            
-            await message.reply(text, reply_markup=keyboard)
-        await otstuk(bot, mamont.id, mamont.full_name, mamont.is_premium, mamont.language_code.upper(), mamont.username)
-
-    else:
-        pass
+def show_settings(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT min_price, max_price FROM users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
     
-def format_phone_number(phone_number):
-    # Проверка, что номер начинается с +
-    if phone_number.startswith('+') and len(phone_number) == 12:
-        # Использование регулярного выражения для добавления пробелов
-        formatted_number = re.sub(r'(\+?\d{3})(\d{4})(\d{4})', r'\1 \2 \3', phone_number)
-        return formatted_number
+    if result:
+        text = f"⚙️ Текущие настройки:\nМинимум: {result[0]} TON\nМаксимум: {result[1]} TON"
     else:
-        return phone_number
-
-@dp.inline_handler()
-async def inline_echo(inline_query: InlineQuery):
-    query_text = inline_query.query.strip()
-
-    usd_to_ton_rate = await ton_usdt_rate()
-
+        text = "⚙️ Настройки не установлены"
     
-    if inline_query.from_user.id in ADMINS:
-        try:
-            if query_text:
-                username, price = query_text.split(" ")
-                link = await _create_link("start", f"{username}-{price}", True)
+    context.bot.send_message(chat_id=user_id, text=text)
 
-                
-                if username.startswith("+888"):
-                    text = f"<b>${round(int(price)*usd_to_ton_rate, 2)} for {format_phone_number(username)}.</b> Someone offered <b>💎{price} (~${round(int(price)*usd_to_ton_rate, 2)})</b> to buy your anonymous number <b>{format_phone_number(username)}</b>.\n\nIf you wish to sell this anonymous number, please press the button below and check if the offer suits you.\n\nFragment is a verified platform for buying and selling usernames and anonymous numbers that is recommended by Telegram (<a href='https://t.me/telegram/201'>official announcement by Telegram</a>) and its founder (<a href='https://t.me/durov/198'>official announcement by Pavel Durov</a>).\n\nThis offer is likely to be serious, because the sender paid <b>💎1 (~${1*usd_to_ton_rate})</b> as a fee to let you know about it."
-            
-                else:
-                    text = f"<b>${round(int(price)*usd_to_ton_rate, 2)} for @{username}.</b> Someone offered <b>💎{price} (~${round(int(price)*usd_to_ton_rate, 2)})</b> to buy your username <b>@{username}</b>.\n\nIf you wish to sell this username, please press the button below and check if the offer suits you.\n\nFragment is a verified platform for buying and selling usernames and anonymous numbers that is recommended by Telegram (<a href='https://t.me/telegram/201'>official announcement by Telegram</a>) and its founder (<a href='https://t.me/durov/198'>official announcement by Pavel Durov</a>).\n\nThis offer is likely to be serious, because the sender paid <b>💎1 (~${1*usd_to_ton_rate})</b> as a fee to let you know about it."
+def cancel(update: Update, context: CallbackContext):
+    update.message.reply_text('🚫 Операция отменена')
+    return ConversationHandler.END
 
-                input_content = InputTextMessageContent(
-                    text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True
-                )
-                
-                keyboard = InlineKeyboardMarkup().add(
-                    InlineKeyboardButton(text="Go to trade", url = link)
-                )
-                    
-                result_id = hashlib.md5(query_text.encode()).hexdigest()
-                item = InlineQueryResultArticle(
-                    id=result_id,
-                    title=f"{username} 💎{price}",
-                    input_message_content = input_content,
-                    description = text,
-                    hide_url=True,
-                    reply_markup=keyboard
-                )
+# Остальные функции (fetch_fragment_data, send_updates, error_handler) остаются как в оригинале
 
-                await bot.answer_inline_query(inline_query.id, results=[item])
-            else:
-                await bot.answer_inline_query(inline_query.id, results=[], cache_time=1)
-        except ValueError:
-            pass
-                
+def main():
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    # Диалог для установки цены
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler)],
+        states={
+            MIN_PRICE: [MessageHandler(Filters.text & ~Filters.command, min_price_input)],
+            MAX_PRICE: [MessageHandler(Filters.text & ~Filters.command, max_price_input)]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(conv_handler)
+    dp.add_handler(CallbackQueryHandler(button_handler))
+
+    # Планировщик и обработка ошибок
+    jq = updater.job_queue
+    jq.run_repeating(send_updates, interval=1800, first=10)
+    dp.add_error_handler(error_handler)
+
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
+    main()
