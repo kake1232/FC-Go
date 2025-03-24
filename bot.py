@@ -1,7 +1,5 @@
-import os
 import logging
 from datetime import datetime
-from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -16,11 +14,10 @@ import pandas as pd
 from sqlalchemy import create_engine, Column, String, Boolean, Integer, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# --- Конфигурация ---
-load_dotenv()
-TOKEN = os.getenv("TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
-DATABASE_URL = os.getenv("DATABASE_URL")
+# --- Конфигурация (все данные в коде!) ---
+TOKEN = "ВАШ_ТОКЕН_БОТА"  # Замените на реальный токен
+ADMIN_ID = 123456789  # Ваш Telegram ID
+DATABASE_URL = "sqlite:///bot.db"  # Путь к SQLite-файлу
 
 # Инициализация базы данных
 Base = declarative_base()
@@ -87,9 +84,8 @@ async def request_report(update: Update, context: CallbackContext):
     return REPORT
 
 async def handle_report(update: Update, context: CallbackContext):
-    # Логика обработки отчета и сохранения скриншотов
+    # Логика обработки отчета
     await update.message.reply_text("📊 Данные за последние 10 минут:")
-    # ... (код для отправки данных из Excel)
     return ConversationHandler.END
 
 # --- Админ-панель ---
@@ -108,14 +104,13 @@ async def send_scheduled_data(context: CallbackContext):
     session = Session()
     users = session.query(User).all()
     for user in users:
-        # Логика выборки данных из Excel
+        # Логика отправки данных из Excel
         await context.bot.send_message(chat_id=user.chat_id, text="📅 Данные: ...")
 
 # --- Инициализация бота ---
 def main():
     application = Application.builder().token(TOKEN).build()
     
-    # Conversation Handler для основного потока
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -125,10 +120,8 @@ def main():
         fallbacks=[]
     )
     
-    # Админ-команды
     application.add_handler(CommandHandler('admin', admin_panel))
     
-    # Планировщик
     scheduler = AsyncIOScheduler()
     scheduler.add_job(send_scheduled_data, 'interval', minutes=10)
     scheduler.start()
