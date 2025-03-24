@@ -1,145 +1,141 @@
 import os
 import logging
-from threading import Event
-from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Updater,
+    Application,
     CommandHandler,
-    CallbackContext,
-    CallbackQueryHandler,
-    ConversationHandler,
     MessageHandler,
-    Filters
+    filters,
+    CallbackContext,
+    ConversationHandler,
 )
-import requests
-import sqlite3
-from datetime import datetime, timedelta
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import pandas as pd
+from sqlalchemy import create_engine, Column, String, Boolean, Integer, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Константы состояний
-MIN_PRICE, MAX_PRICE = range(2)
+# --- Конфигурация ---
+load_dotenv()
+TOKEN = os.getenv("TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Настройки
-TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-API_URL = "https://api.fragment.com/numbers"
-DB_NAME = "users.db"
+# Инициализация базы данных
+Base = declarative_base()
+engine = create_engine(DATABASE_URL)
+Session = sessionmaker(bind=engine)
 
-# Инициализация БД
-conn = sqlite3.connect(DB_NAME)
-cursor = conn.cursor()
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        min_price REAL,
-        max_price REAL
-    )
-''')
-conn.commit()
+# Модели данных
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    username = Column(String)
+    chat_id = Column(Integer)
+    status = Column(String)  # 'premium', 'blocked', 'default'
+    last_report = Column(DateTime)
 
-# Логирование
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
+class AuthCode(Base):
+    __tablename__ = 'auth_codes'
+    code = Column(String, primary_key=True)
+    used = Column(Boolean, default=False)
 
-def start(update: Update, context: CallbackContext):
-    keyboard = [
-        [InlineKeyboardButton("🎯 Установить ценовой диапазон", callback_data='set_price')],
-        [InlineKeyboardButton("📊 Текущие настройки", callback_data='show_settings')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text(
-        "🚀 Добро пожаловать в NFT-монитор Fragment!",
-        reply_markup=reply_markup
-    )
+Base.metadata.create_all(engine)
 
-def button_handler(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
+# Состояния для ConversationHandler
+AUTH, REPORT, ADMIN = range(3)
+
+# --- Вспомогательные функции ---
+def generate_keyboard(buttons):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=data)] for text, data in buttons])
+
+async def send_to_admin(context: CallbackContext, message: str):
+    await context.bot.send_message(chat_id=ADMIN_ID, text=message)
+
+# --- Обработчики команд ---
+async def start(update: Update, context: CallbackContext):
+    await update.message.reply_text("👋 Добро пожаловать! Введите одноразовый код для авторизации:")
+    return AUTH
+
+async def handle_auth_code(update: Update, context: CallbackContext):
+    code = update.message.text.upper()
+    session = Session()
+    auth_code = session.query(AuthCode).filter_by(code=code, used=False).first()
     
-    if query.data == 'set_price':
-        query.message.reply_text("Введите минимальную цену в TON:")
-        return MIN_PRICE
-    elif query.data == 'show_settings':
-        show_settings(update, context)
-    return ConversationHandler.END
-
-def min_price_input(update: Update, context: CallbackContext):
-    try:
-        price = float(update.message.text)
-        context.user_data['min_price'] = price
-        update.message.reply_text("Теперь введите максимальную цену в TON:")
-        return MAX_PRICE
-    except ValueError:
-        update.message.reply_text("❌ Ошибка! Введите число. Попробуйте снова:")
-        return MIN_PRICE
-
-def max_price_input(update: Update, context: CallbackContext):
-    try:
-        max_price = float(update.message.text)
-        min_price = context.user_data.get('min_price', 0)
-        
-        if max_price <= min_price:
-            raise ValueError("Максимум должен быть больше минимума")
-        
-        # Сохранение в БД
-        user_id = update.effective_user.id
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO users (user_id, min_price, max_price)
-            VALUES (?, ?, ?)
-        ''', (user_id, min_price, max_price))
-        conn.commit()
-        
-        update.message.reply_text(f"✅ Диапазон установлен: {min_price} - {max_price} TON")
+    if auth_code:
+        auth_code.used = True
+        user = User(
+            username=update.effective_user.username,
+            chat_id=update.effective_chat.id,
+            status='default'
+        )
+        session.add(user)
+        session.commit()
+        await send_to_admin(context, f"🚨 Код {code} использован пользователем @{user.username}")
+        await update.message.reply_text("✅ Авторизация успешна!", reply_markup=main_menu())
         return ConversationHandler.END
-    except ValueError as e:
-        update.message.reply_text(f"❌ Ошибка: {str(e)}. Введите корректную цену:")
-        return MAX_PRICE
-
-def show_settings(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT min_price, max_price FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
-    
-    if result:
-        text = f"⚙️ Текущие настройки:\nМинимум: {result[0]} TON\nМаксимум: {result[1]} TON"
     else:
-        text = "⚙️ Настройки не установлены"
-    
-    context.bot.send_message(chat_id=user_id, text=text)
+        await update.message.reply_text("❌ Неверный код! Попробуйте еще раз:")
+        return AUTH
 
-def cancel(update: Update, context: CallbackContext):
-    update.message.reply_text('🚫 Операция отменена')
+async def request_report(update: Update, context: CallbackContext):
+    await update.message.reply_text(
+        "📝 Перед получением данных отправьте отчет:",
+        reply_markup=generate_keyboard([("Премиум", "premium"), ("Блок в чате", "blocked"), ("Другое", "other")])
+    )
+    return REPORT
+
+async def handle_report(update: Update, context: CallbackContext):
+    # Логика обработки отчета и сохранения скриншотов
+    await update.message.reply_text("📊 Данные за последние 10 минут:")
+    # ... (код для отправки данных из Excel)
     return ConversationHandler.END
 
-# Остальные функции (fetch_fragment_data, send_updates, error_handler) остаются как в оригинале
+# --- Админ-панель ---
+async def admin_panel(update: Update, context: CallbackContext):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    buttons = [
+        ("Загрузить Excel", "upload_excel"),
+        ("Сгенерировать код", "generate_code"),
+        ("Список пользователей", "list_users")
+    ]
+    await update.message.reply_text("⚙️ Панель администратора:", reply_markup=generate_keyboard(buttons))
 
+# --- Планировщик задач ---
+async def send_scheduled_data(context: CallbackContext):
+    session = Session()
+    users = session.query(User).all()
+    for user in users:
+        # Логика выборки данных из Excel
+        await context.bot.send_message(chat_id=user.chat_id, text="📅 Данные: ...")
+
+# --- Инициализация бота ---
 def main():
-    updater = Updater(TOKEN, use_context=True)
-    dp = updater.dispatcher
-
-    # Диалог для установки цены
+    application = Application.builder().token(TOKEN).build()
+    
+    # Conversation Handler для основного потока
     conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler)],
+        entry_points=[CommandHandler('start', start)],
         states={
-            MIN_PRICE: [MessageHandler(Filters.text & ~Filters.command, min_price_input)],
-            MAX_PRICE: [MessageHandler(Filters.text & ~Filters.command, max_price_input)]
+            AUTH: [MessageHandler(filters.TEXT, handle_auth_code)],
+            REPORT: [MessageHandler(filters.PHOTO | filters.TEXT, handle_report)]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[]
     )
+    
+    # Админ-команды
+    application.add_handler(CommandHandler('admin', admin_panel))
+    
+    # Планировщик
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(send_scheduled_data, 'interval', minutes=10)
+    scheduler.start()
+    
+    application.add_handler(conv_handler)
+    application.run_polling()
 
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(conv_handler)
-    dp.add_handler(CallbackQueryHandler(button_handler))
-
-    # Планировщик и обработка ошибок
-    jq = updater.job_queue
-    jq.run_repeating(send_updates, interval=1800, first=10)
-    dp.add_error_handler(error_handler)
-
-    updater.start_polling()
-    updater.idle()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     main()
